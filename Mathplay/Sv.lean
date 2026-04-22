@@ -44,6 +44,7 @@ inductive Expr : Type where
 | concat      : Expr → Expr → Expr
 | range       : Expr → (hi lo : Nat) → Expr
 | and         : Expr → Expr → Expr
+deriving Repr
 
 /- ---------------------------------------------------------------------------------------------- -/
 -- Notation
@@ -172,6 +173,7 @@ inductive TExpr (Γ : Context) : Nat → Type where
     → (hle : lo ≤ hi)
     → TExpr Γ w → TExpr Γ (hi - lo + 1)
 | and : {w : Nat} → TExpr Γ w → TExpr Γ w → TExpr Γ w
+deriving Repr
 
 def TExpr.mk_range {w : Nat} {Γ : Context} (e : @TExpr Γ w) (hi lo : Nat)
   (hw : hi < w := by decide) (hle : lo ≤ hi := by decide) :=
@@ -274,6 +276,23 @@ example : eval (TExpr.and dead dead) = 0xdead#16 := by rfl
 example : eval (TExpr.and dead aval) = 0xde00#16 := by rfl
 example : eval (TExpr.and dead bval) = 0x00ad#16 := by rfl
 example : eval (TExpr.and aval bval) = 0x0000#16 := by rfl
+
+
+-- Evaluate one expression
+def toto' : Option (Sigma (fun w => Val w)) := do
+  let Γ : Context :=
+    Context.empty
+    |>.insert "a" 32
+    |>.insert "b" 16
+  let e := sv{ 16#0xff00 & b & 16#0x00ff }
+  let ⟨w, te⟩ ← infer e Γ
+  let val := eval te
+  pure ⟨w, val⟩
+
+-- So far `b` evaluates to its width, we'd like a way to prove
+-- the result is 0 forall `b`
+-- I dunno how to rework the evaluator so we can reason on generic variables.
+#eval toto'
 
 
 end SV
