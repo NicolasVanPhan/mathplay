@@ -51,6 +51,10 @@ inductive Expr : Type where
 
 declare_syntax_cat sv_scope
 syntax ident : sv_scope
+-- Constant: width#value (value can be decimal, 0xHEX, or 0bBIN)
+syntax num "#" ident : sv_scope
+syntax num "#" num : sv_scope
+syntax num : sv_scope                                  -- Numeric constant
 syntax sv_scope "[" num ":" num "]" : sv_scope         -- Range
 syntax "{" sv_scope "," sv_scope "}" : sv_scope        -- Concat
 syntax sv_scope "&" sv_scope : sv_scope                -- And
@@ -64,6 +68,13 @@ partial def sv_parse : Syntax → MacroM (TSyntax `term) := fun stx =>
   | `(sv_scope| $id:ident) => do
       let s := Syntax.mkStrLit id.getId.toString
       `(Expr.ident $s)
+  /- Constant with width: width#value -/
+  | `(sv_scope| $w:num#$val:num) => do
+      `(Expr.const (BitVec.ofNat $w $val))
+  /- Constant with width and ident (for hex/binary): width#valueIdent -/
+  | `(sv_scope| $w:num#$val:ident) => do
+      -- Just use the ident directly as a Nat - Lean will parse 0xHEX and 0bBIN
+      `(Expr.const (BitVec.ofNat $w ($val : Nat)))
   /- Range -/
   | `(sv_scope| $base:sv_scope[$hi:num:$lo:num]) => do
       let base' ← sv_parse base
@@ -89,6 +100,8 @@ macro_rules
 #eval sv{ foo[7:0][4:0] }
 #eval sv{ {foo, bar} }
 #eval sv{ {foo[3:0], bar[4:0]} }
+#eval sv{ 8#240 }
+#eval sv{ 8#240 & 8#240 }
 
 
 -- Unit tests for notation
@@ -98,6 +111,22 @@ example : sv{ foo[7:0][4:0] } = Expr.range (SV.Expr.range (SV.Expr.ident "foo") 
 example : sv{ {foo, bar} } = Expr.concat (SV.Expr.ident "foo") (SV.Expr.ident "bar") := by rfl
 example : sv{ foo & bar } = Expr.and (SV.Expr.ident "foo") (SV.Expr.ident "bar") := by rfl
 
+/- Constants with convenience notation -/
+-- Test: sv{ 8#240 } should be Expr.const (0xf0#8)
+example : sv{ 8#240 } = Expr.const (240 : BitVec 8) := by rfl
+example : sv{ 4#15 } = Expr.const (15 : BitVec 4) := by rfl
+example : sv{ 8#240 & 8#240 } =
+  Expr.and (Expr.const (240 : BitVec 8)) (Expr.const (240 : BitVec 8)) := by rfl
+
+/- Hex and binary constants -/
+-- 0xf0 = 240 in decimal
+example : sv{ 8#0xf0 } = Expr.const (240 : BitVec 8) := by rfl
+-- 0b11110000 = 240 in decimal
+example : sv{ 8#0b11110000 } = Expr.const (240 : BitVec 8) := by rfl
+-- 0xdeadbeef
+example : sv{ 32#0xdeadbeef } = Expr.const (0xdeadbeef : BitVec 32) := by rfl
+
+example : sv{ 8#0xf0 & a } = Expr.and (Expr.const (240 : BitVec 8)) (Expr.ident "a") := by rfl
 
 /- ===============================================================================================-/
 -- Typed AST
