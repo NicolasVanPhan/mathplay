@@ -43,6 +43,7 @@ inductive Expr : Type where
 | ident       : String → Expr
 | concat      : Expr → Expr → Expr
 | range       : Expr → (hi lo : Nat) → Expr
+| and         : Expr → Expr → Expr
 
 /- ---------------------------------------------------------------------------------------------- -/
 -- Notation
@@ -50,8 +51,10 @@ inductive Expr : Type where
 
 declare_syntax_cat sv_scope
 syntax ident : sv_scope
--- Range
-syntax sv_scope "[" num ":" num "]" : sv_scope
+syntax sv_scope "[" num ":" num "]" : sv_scope         -- Range
+syntax "{" sv_scope "," sv_scope "}" : sv_scope        -- Concat
+syntax sv_scope "&" sv_scope : sv_scope                -- And
+
 -- Toplevel wrapper
 syntax "sv{" sv_scope "}" : term
 
@@ -65,6 +68,16 @@ partial def sv_parse : Syntax → MacroM (TSyntax `term) := fun stx =>
   | `(sv_scope| $base:sv_scope[$hi:num:$lo:num]) => do
       let base' ← sv_parse base
       `(Expr.range $base' $hi $lo)
+  /- Concat -/
+  | `(sv_scope| { $x:sv_scope , $y:sv_scope }) => do
+      let x' ← sv_parse x
+      let y' ← sv_parse y
+      `(Expr.concat $x' $y')
+  /- And -/
+  | `(sv_scope| $x:sv_scope & $y:sv_scope) => do
+      let x' ← sv_parse x
+      let y' ← sv_parse y
+      `(Expr.and $x' $y')
   /- _ -/
   | _ => Macro.throwError s!"unexpected sv_scope syntax: {stx}"
 
@@ -74,12 +87,16 @@ macro_rules
 #eval sv{ tititi }
 #eval sv{ foo[7:0] }
 #eval sv{ foo[7:0][4:0] }
+#eval sv{ {foo, bar} }
+#eval sv{ {foo[3:0], bar[4:0]} }
 
 
 -- Unit tests for notation
 example : sv{ tititi } = Expr.ident "tititi" := by rfl
 example : sv{ foo[7:0] } = Expr.range (SV.Expr.ident "foo") 7 0 := by rfl
 example : sv{ foo[7:0][4:0] } = Expr.range (SV.Expr.range (SV.Expr.ident "foo") 7 0) 4 0 := by rfl
+example : sv{ {foo, bar} } = Expr.concat (SV.Expr.ident "foo") (SV.Expr.ident "bar") := by rfl
+example : sv{ foo & bar } = Expr.and (SV.Expr.ident "foo") (SV.Expr.ident "bar") := by rfl
 
 
 /- ===============================================================================================-/
@@ -125,6 +142,7 @@ inductive TExpr (Γ : Context) : Nat → Type where
     → (hw : hi < w)
     → (hle : lo ≤ hi)
     → TExpr Γ w → TExpr Γ (hi - lo + 1)
+| and : {w : Nat} → TExpr Γ w → TExpr Γ w → TExpr Γ w
 
 def TExpr.mk_range {w : Nat} {Γ : Context} (e : @TExpr Γ w) (hi lo : Nat)
   (hw : hi < w := by decide) (hle : lo ≤ hi := by decide) :=
@@ -158,6 +176,16 @@ def infer (e : Expr) (Γ : Context) : Option (Sigma (fun w => TExpr Γ w)) :=
             some ⟨hi - lo + 1, TExpr.range hi lo hw hle te⟩
           else none
         else none
+  | Expr.and e1 e2 =>
+     let te1 := infer e1 Γ
+     let te2 := infer e2 Γ
+     match te1, te2 with
+     | some ⟨w1, te1⟩, some ⟨w2, te2⟩ =>
+       if h : w1 = w2 then
+         some ⟨w1, TExpr.and te1 (h ▸ te2)⟩
+       else
+         none
+     | _, _ => none
 
 
 /- ===============================================================================================-/
@@ -171,12 +199,22 @@ def eval {Γ : Context} (e : @TExpr Γ n) : Val n :=
   | @ident _ w _ _ => w
   | concat e1 e2 => (eval e1) ++ (eval e2)
   | range hi lo hw hle e => vec_range (eval e) hi lo hw hle
+  | TExpr.and e1 e2 => (eval e1) &&& (eval e2)
 
 
 /- Testing const and concat -/
 
-def dead := TExpr.const (Γ := ctx) (0xdead#16)
-def beef := TExpr.const (Γ := ctx) (0xbeef#16)
+def myctx : Context :=
+  Context.empty
+  |>.insert "a" 8
+  |>.insert "b" 16
+
+example : myctx.get? "a" = some 8 := by rfl
+example : myctx.get? "z" = none := by rfl
+
+
+def dead := TExpr.const (Γ := myctx) (0xdead#16)
+def beef := TExpr.const (Γ := myctx) (0xbeef#16)
 
 example : eval dead = 0xdead#16 := by rfl
 example : eval beef = 0xbeef#16 := by rfl
@@ -186,6 +224,7 @@ example : eval (TExpr.concat dead beef) = 0xdeadbeef#32 := by rfl
 #eval eval (TExpr.ident (Γ := ctx) "a" (by
   simp [ctx, Context.empty, Context.get?, Context.insert]; rfl
 ))
+
 
 #eval BitVec.ushiftRight (eval dead) 8
 #eval BitVec.truncate 8 (eval dead)
@@ -197,5 +236,15 @@ example : eval (TExpr.mk_range dead 15 8 ) = 0xde#8 := by decide
 example : eval (TExpr.mk_range dead 7  0 ) = 0xad#8 := by decide
 example : eval (TExpr.mk_range dead 11 4 ) = 0xea#8 := by decide
 example : eval (TExpr.mk_range dead 0  0 ) = 0x1#1 := by decide
+
+/- Testing and -/
+
+def aval := TExpr.const (Γ := myctx) (0xff00#16)
+def bval := TExpr.const (Γ := myctx) (0x00ff#16)
+example : eval (TExpr.and dead dead) = 0xdead#16 := by rfl
+example : eval (TExpr.and dead aval) = 0xde00#16 := by rfl
+example : eval (TExpr.and dead bval) = 0x00ad#16 := by rfl
+example : eval (TExpr.and aval bval) = 0x0000#16 := by rfl
+
 
 end SV
