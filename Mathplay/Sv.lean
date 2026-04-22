@@ -28,11 +28,15 @@ example : vec_range 0xdeadbeef#32 15 8 = 0xbe#8 := by rfl
 example : vec_range 0xdeadbeef#32 0 0  = 0x1#1 := by rfl
 example : vec_range 0xdeadbeef#32 4 4  = 0x0#1 := by rfl
 
-/- ---------------------------------------------------------------------------------------------- -/
+/- ===============================================================================================-/
 -- Untyped AST
-/- ---------------------------------------------------------------------------------------------- -/
+/- ===============================================================================================-/
 
 abbrev Width := Nat
+
+/- ---------------------------------------------------------------------------------------------- -/
+-- The AST
+/- ---------------------------------------------------------------------------------------------- -/
 
 inductive Expr : Type where
 | const {w}   : Val w → Expr
@@ -40,6 +44,9 @@ inductive Expr : Type where
 | concat      : Expr → Expr → Expr
 | range       : Expr → (hi lo : Nat) → Expr
 
+/- ---------------------------------------------------------------------------------------------- -/
+-- Notation
+/- ---------------------------------------------------------------------------------------------- -/
 
 declare_syntax_cat sv_scope
 syntax ident : sv_scope
@@ -69,15 +76,22 @@ macro_rules
 #eval sv{ foo[7:0][4:0] }
 
 
+-- Unit tests for notation
 example : sv{ tititi } = Expr.ident "tititi" := by rfl
 example : sv{ foo[7:0] } = Expr.range (SV.Expr.ident "foo") 7 0 := by rfl
 example : sv{ foo[7:0][4:0] } = Expr.range (SV.Expr.range (SV.Expr.ident "foo") 7 0) 4 0 := by rfl
 
 
-/- ---------------------------------------------------------------------------------------------- -/
+/- ===============================================================================================-/
 -- Typed AST
-/- ---------------------------------------------------------------------------------------------- -/
+/- ===============================================================================================-/
 
+/- ---------------------------------------------------------------------------------------------- -/
+-- Context
+--
+-- We need to define a context type, a mapping from name to length
+-- so we can determine the width of signals depending on previous signals' widths
+/- ---------------------------------------------------------------------------------------------- -/
 
 abbrev Context := List (String × Width)
 
@@ -100,6 +114,8 @@ example : ctx.get? "a" = some 8 := by rfl
 example : ctx.get? "z" = none := by rfl
 
 /- ---------------------------------------------------------------------------------------------- -/
+-- AST
+/- ---------------------------------------------------------------------------------------------- -/
 
 inductive TExpr (Γ : Context) : Nat → Type where
 | const {w} : Val w → TExpr Γ w
@@ -114,7 +130,8 @@ def TExpr.mk_range {w : Nat} {Γ : Context} (e : @TExpr Γ w) (hi lo : Nat)
   (hw : hi < w := by decide) (hle : lo ≤ hi := by decide) :=
   TExpr.range hi lo hw hle e
 
-
+/- ---------------------------------------------------------------------------------------------- -/
+-- Typer
 /- ---------------------------------------------------------------------------------------------- -/
 
 def infer (e : Expr) (Γ : Context) : Option (Sigma (fun w => TExpr Γ w)) :=
@@ -132,7 +149,7 @@ def infer (e : Expr) (Γ : Context) : Option (Sigma (fun w => TExpr Γ w)) :=
      | some ⟨w1, te1⟩, some ⟨w2, te2⟩ =>
        some ⟨w1 + w2, TExpr.concat te1 te2⟩
      | _, _ => none
-  | Expr.range e hi lo =>
+  | Expr.range e hi lo => do
       match infer e Γ with
       | none => none
       | some ⟨w, te⟩ =>
@@ -143,8 +160,9 @@ def infer (e : Expr) (Γ : Context) : Option (Sigma (fun w => TExpr Γ w)) :=
         else none
 
 
-/- ---------------------------------------------------------------------------------------------- -/
-
+/- ===============================================================================================-/
+-- Evaluator
+/- ===============================================================================================-/
 
 def eval {Γ : Context} (e : @TExpr Γ n) : Val n :=
   open TExpr in
@@ -179,3 +197,5 @@ example : eval (TExpr.mk_range dead 15 8 ) = 0xde#8 := by decide
 example : eval (TExpr.mk_range dead 7  0 ) = 0xad#8 := by decide
 example : eval (TExpr.mk_range dead 11 4 ) = 0xea#8 := by decide
 example : eval (TExpr.mk_range dead 0  0 ) = 0x1#1 := by decide
+
+end SV
