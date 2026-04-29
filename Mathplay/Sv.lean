@@ -183,54 +183,52 @@ def TExpr.mk_range {w : Nat} {Γ : Context} (e : @TExpr Γ w) (hi lo : Nat)
 -- Typer
 /- ---------------------------------------------------------------------------------------------- -/
 
-def infer (e : Expr) (Γ : Context) : Option (Sigma (fun w => TExpr Γ w)) :=
-  match e with
-  | @Expr.const w (val : Val w) =>
-      some (Sigma.mk w (TExpr.const val))
-  | Expr.ident (s : String) =>
-      match h: Γ.get? s with
-      | none => none
-      | some w => some (Sigma.mk w (TExpr.ident s h))
+/-- Compute output width from expression structure alone. -/
+def inferWidth (Γ : Context) : Expr → Width
+  | @Expr.const w _   => w
+  | Expr.ident s      => (Γ.get? s).getD 0
+  | Expr.concat e1 e2 => inferWidth Γ e1 + inferWidth Γ e2
+  | Expr.range _ hi lo => hi - lo + 1
+  | Expr.and e1 _     => inferWidth Γ e1
+
+/-- Type inference: always returns a `TExpr` indexed by the inferred width.
+    - Well-typed input  → correct typed AST.
+    - Ill-typed input   → zero-constant junk (your theorem won't typecheck anyway). -/
+def infer (Γ : Context) : (e : Expr) → TExpr Γ (inferWidth Γ e)
+  | @Expr.const _ val => TExpr.const val
+  | Expr.ident s =>
+      match h : Γ.get? s with
+      | some _ => by simp only [inferWidth, h]; exact TExpr.ident s h
+      | none   => by simp only [inferWidth, h]; exact TExpr.const 0
   | Expr.concat e1 e2 =>
-     let te1 := infer e1 Γ
-     let te2 := infer e2 Γ
-     match te1, te2 with
-     | some ⟨w1, te1⟩, some ⟨w2, te2⟩ =>
-       some ⟨w1 + w2, TExpr.concat te1 te2⟩
-     | _, _ => none
-  | Expr.range e hi lo => do
-      match infer e Γ with
-      | none => none
-      | some ⟨w, te⟩ =>
-        if hle : lo ≤ hi then
-          if hw : hi < w then
-            some ⟨hi - lo + 1, TExpr.range hi lo hw hle te⟩
-          else none
-        else none
+      TExpr.concat (infer Γ e1) (infer Γ e2)
+  | Expr.range base hi lo =>
+      if hle : lo ≤ hi then
+        if hw : hi < inferWidth Γ base
+        then TExpr.range hi lo hw hle (infer Γ base)
+        else TExpr.const (0 : BitVec (hi - lo + 1))  -- junk for bad bounds
+      else   TExpr.const (0 : BitVec (hi - lo + 1))  -- junk for lo > hi
   | Expr.and e1 e2 =>
-     let te1 := infer e1 Γ
-     let te2 := infer e2 Γ
-     match te1, te2 with
-     | some ⟨w1, te1⟩, some ⟨w2, te2⟩ =>
-       if h : w1 = w2 then
-         some ⟨w1, TExpr.and te1 (h ▸ te2)⟩
-       else
-         none
-     | _, _ => none
+      if h : inferWidth Γ e1 = inferWidth Γ e2
+      then TExpr.and (infer Γ e1) (by rw [inferWidth, h]; exact infer Γ e2)
+      else infer Γ e1  -- junk for width mismatch
 
 
 /- ===============================================================================================-/
 -- Evaluator
 /- ===============================================================================================-/
 
-def eval {Γ : Context} (e : @TExpr Γ n) : Val n :=
+-- A valuation assigns actual BitVec values to identifiers
+abbrev Valuation (Γ : Context) := (s : String) → {w : Nat} → (h : Γ.get? s = some w) → Val w
+
+def eval {Γ : Context} (val : Valuation Γ) (e : @TExpr Γ n) : Val n :=
   open TExpr in
   match e with
   | TExpr.const v => v
-  | @ident _ w _ _ => w
-  | concat e1 e2 => (eval e1) ++ (eval e2)
-  | range hi lo hw hle e => vec_range (eval e) hi lo hw hle
-  | TExpr.and e1 e2 => (eval e1) &&& (eval e2)
+  | @ident _ w s h => val s h
+  | concat e1 e2 => (eval val e1) ++ (eval val e2)
+  | range hi lo hw hle e => vec_range (eval val e) hi lo hw hle
+  | TExpr.and e1 e2 => (eval val e1) &&& (eval val e2)
 
 
 /- Testing const and concat -/
@@ -247,52 +245,82 @@ example : myctx.get? "z" = none := by rfl
 def dead := TExpr.const (Γ := myctx) (0xdead#16)
 def beef := TExpr.const (Γ := myctx) (0xbeef#16)
 
-example : eval dead = 0xdead#16 := by rfl
-example : eval beef = 0xbeef#16 := by rfl
+-- Create a simple valuation for myctx
+def myValuation : Valuation myctx := fun s {w} h => by
+  -- h : myctx.get? s = some w
+  -- We need to determine w from the fact that s is in myctx
+  dsimp only [myctx, Context.empty, Context.get?, Context.insert] at h
+  -- Now h should be a concrete conditional we can split on
+  split at h
+  · -- First case: "b" = s, so w = 16
+    injection h with eq_w
+    exact eq_w ▸ (0xbbbb : BitVec 16)
+  · -- Second case: "b" != s, so need to check "a" = s
+    split at h
+    · -- When "a" = s, so w = 8
+      injection h with eq_w
+      exact eq_w ▸ (0xaa : BitVec 8)
+    · -- Neither "a" nor "b" matches
+      cases h
 
-example : eval (TExpr.concat dead beef) = 0xdeadbeef#32 := by rfl
+example : eval myValuation dead = 0xdead#16 := by rfl
+example : eval myValuation beef = 0xbeef#16 := by rfl
 
-#eval eval (TExpr.ident (Γ := ctx) "a" (by
+example : eval myValuation (TExpr.concat dead beef) = 0xdeadbeef#32 := by rfl
+
+-- Test with the existing ctx which maps "a" to 8 bits
+def ctx_val : Valuation ctx := fun s {w} h => by
+  dsimp only [ctx, Context.empty, Context.get?, Context.insert] at h
+  -- First split handles the outer if on "b" = s
+  split at h
+  · -- When "b" = s, h : some 16 = some w
+    injection h with eq_w
+    exact eq_w ▸ (0xbbbb : BitVec 16)
+  · -- When "b" != s, h : (if "a" = s then some 8 else none) = some w
+    -- Split again to handle the inner if on "a" = s
+    split at h
+    · -- When "a" = s, h : some 8 = some w
+      injection h with eq_w
+      exact eq_w ▸ (0xaa : BitVec 8)
+    · -- When "a" != s either, h : none = some w (impossible)
+      cases h
+
+#eval eval ctx_val (TExpr.ident (Γ := ctx) "a" (by
   simp [ctx, Context.empty, Context.get?, Context.insert]; rfl
 ))
 
-
-#eval BitVec.ushiftRight (eval dead) 8
-#eval BitVec.truncate 8 (eval dead)
-
-
-example : eval (TExpr.mk_range dead 15 8 ) = 0xde#8 := by decide
-example : eval (TExpr.mk_range dead 15 8 ) = 0xde#8 := by decide
-
-example : eval (TExpr.mk_range dead 7  0 ) = 0xad#8 := by decide
-example : eval (TExpr.mk_range dead 11 4 ) = 0xea#8 := by decide
-example : eval (TExpr.mk_range dead 0  0 ) = 0x1#1 := by decide
+-- Test range extraction
+example : eval myValuation (TExpr.mk_range dead 15 8 ) = 0xde#8 := by decide
+example : eval myValuation (TExpr.mk_range dead 7  0 ) = 0xad#8 := by decide
+example : eval myValuation (TExpr.mk_range dead 11 4 ) = 0xea#8 := by decide
+example : eval myValuation (TExpr.mk_range dead 0  0 ) = 0x1#1 := by decide
 
 /- Testing and -/
 
 def aval := TExpr.const (Γ := myctx) (0xff00#16)
 def bval := TExpr.const (Γ := myctx) (0x00ff#16)
-example : eval (TExpr.and dead dead) = 0xdead#16 := by rfl
-example : eval (TExpr.and dead aval) = 0xde00#16 := by rfl
-example : eval (TExpr.and dead bval) = 0x00ad#16 := by rfl
-example : eval (TExpr.and aval bval) = 0x0000#16 := by rfl
+example : eval myValuation (TExpr.and dead dead) = 0xdead#16 := by rfl
+example : eval myValuation (TExpr.and dead aval) = 0xde00#16 := by rfl
+example : eval myValuation (TExpr.and dead bval) = 0x00ad#16 := by rfl
+example : eval myValuation (TExpr.and aval bval) = 0x0000#16 := by rfl
 
 
--- Evaluate one expression
-def toto' : Option (Sigma (fun w => Val w)) := do
-  let Γ : Context :=
-    Context.empty
-    |>.insert "a" 32
-    |>.insert "b" 16
-  let e := sv{ 16#0xff00 & b & 16#0x00ff }
-  let ⟨w, te⟩ ← infer e Γ
-  let val := eval te
-  pure ⟨w, val⟩
+/- ===============================================================================================-/
+-- Proof: trivial_circuit always outputs 0
+/- ===============================================================================================-/
 
--- So far `b` evaluates to its width, we'd like a way to prove
--- the result is 0 forall `b`
--- I dunno how to rework the evaluator so we can reason on generic variables.
-#eval toto'
+def trivial_circuit := sv{ 8#0x0f & a & 8#0xf0 }
+
+theorem trivial_circuit_always_zero :
+    ∀ (val : Valuation myctx), eval val (infer myctx trivial_circuit) = 0x00#8 := by
+  intro val
+  -- `infer myctx trivial_circuit` reduces definitionally; expose the bitvector goal
+  -- TODO : Put this automatically so we don't need to mention them in simp
+  simp [infer, myctx, trivial_circuit, inferWidth, Context.empty, Context.insert, Context.get?]
+  simp [eval]
+  -- TODO : Fix warning on bv_decide
+  bv_decide
+
 
 
 end SV
