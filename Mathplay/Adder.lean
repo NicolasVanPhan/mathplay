@@ -28,9 +28,12 @@ open Std
   However the number of bits of the addder is typically a SystemVerilog module parameter,
   so it's fixed to a given constant when fed to the model checker,
   and it ignores the "symmetry" of the design.
+  It doesn't reason on an abstract size `N` but a concrete value (e.g. `4`),
+  bruteforcing its way to prove results on 4-bit signals.
   The proof for a 2048-bits adder will be longer than for a 4-bit adder,
   becuase there is more logic involved.
-  It's a shame, because reasoning on the adder correctness doesn't depend on the adder size.
+  It's a shame, because **the reasoning does not depend on the size**.
+  The size and complexity of the proof on adder correctness is independent of its size.
   It's basically an induction over N. With 2 cases :
   - the bit 0
   - given (N-1)-adder is correct, prove N-adder is correct.
@@ -47,16 +50,29 @@ open Std
   But before that, we need to see how to "describe hardware in Lean",
   how SystemVerilog constructs could be "mapped" to Lean constructs, as smoothly as possible.
 
+  If we manage that, we could then imagine writing a small DSL almost equal to SystemVerilog,
+  from which we could generate both SystemVerilog and Lean4 definitions to reason about.
+
+  With that in mind, we won't just describe an adder in Lean, we'll explore how an adder
+  originally described in typical SystemVerilog constructs
+  could be systematically mapped to Lean constructs,
+  thus preparing the ground for a quasi-SystemVerilog DSL that would trivially generate SV
+  and - thanks to the explored constructs mapping - generate a Lean description.
+
+  TODO : At the end, explain that we showed an example of 'structural' induction
+  but there's another common room for optimization which is 'temporal' induction.
+  e.g. COM proofs by induction on incoming event.
+  Brainstorm a mini-COM example showing the scaling difference
+
 -/
 
-namespace Adder
 
 /-! ## 1-bit full adder -/
 
 /-
 We'll start with a tiny circuit : a 1-bit full adder
 
-It's truth table is describe below :
+Its truth table is describe below :
 ```
 ci a b  |  co r
  0 0 0  |   0 0      // 0 + 0 + 0   = 0 = 0b00
@@ -109,16 +125,16 @@ structure Inputs where
   a : Bool
   b : Bool
   c : Bool
-deriving Repr, DecidableEq
+deriving Repr, DecidableEq, Fintype
 
 /- SV module output declaration -/
 structure Outputs where
   r : Bool
   c : Bool
-deriving Repr, DecidableEq
+deriving Repr, DecidableEq, Fintype
 
 /- SV module body -/
-def body (i : Inputs) : Outputs :=
+def v1.body (i : Inputs) : Outputs :=
   let r := i.a ^^ i.b  ^^ i.c
   let c := i.a && i.b  || i.a && i.c || i.b && i.c
   ⟨r, c⟩
@@ -128,13 +144,13 @@ theorem adder_correct (i : Inputs) :
   let a := i.a.toNat
   let b := i.b.toNat
   let ci := i.c.toNat
-  let r := (body i).r.toNat
-  let co := (body i).c.toNat
+  let r := (v1.body i).r.toNat
+  let co := (v1.body i).c.toNat
   a + b + ci = r + 2 * co := by
   -- Break i into its components (a b c)
   cases i with | mk a b c =>
   -- Normalize the expression to the shortest boolean equation
-  simp only [body]
+  simp only [v1.body]
   -- Solve the decidable bool/nat equation
   decide +revert
 
@@ -149,200 +165,342 @@ theorem adder_correct (i : Inputs) :
    ```verilog
    a_i == 1'b0 && c_i = 1'b0 |-> r_o = c_i
    ```
+
+   In that case, instead of letting it hidden in a `let` inside `def body ...`
+   we can write an explicit `def r...`.
+   All definitions like this, corresponding to a SV module's internal wires,
+   can be put in a `wire` namespace for clarify.
+   So we have `def wire.r ...`
 -/
 
 def wire.r (i : Inputs) : Bool := i.a ^^ i.b  ^^ i.c
 
 /- SV module body -/
-def body' (i : Inputs) : Outputs :=
+def v2.body (i : Inputs) : Outputs :=
   let r := wire.r i
   let c := i.a && i.b  || i.a && i.c || i.b && i.c
   ⟨r, c⟩
 
-  /- Now we can talk about `r` -/
-example : ∀ (i : Inputs), (not i.a) && (not i.c) → (i.b = (body' i).r) := by
+/- Now we reason about `r` -/
+example : ∀ (i : Inputs), (not i.a) && (not i.c) → (i.b = (v2.body i).r) := by
   intro i
   cases i with | mk a b c =>
-  simp only [body']
+  simp only [v2.body]
   decide +revert
 
+/- And the proof still holds -/
+theorem v2.adder_correct (i : Inputs) :
+  let a := i.a.toNat
+  let b := i.b.toNat
+  let ci := i.c.toNat
+  let r := (v2.body i).r.toNat
+  let co := (v2.body i).c.toNat
+  a + b + ci = r + 2 * co := by
+  -- Break i into its components (a b c)
+  cases i with | mk a b c =>
+  -- Normalize the expression to the shortest boolean equation
+  simp only [v2.body]
+  -- Solve the decidable bool/nat equation
+  decide +revert
 
+-- For later use, let's pick the first version
+def body := v1.body
 
-namespace toto
--- Use `decide` for decidable propositions
--- For universally quantified things, it needs `Fintype α`
-example (a b : Bool) : (a && b) = (b && a) := by
-  try simp -- Simp won't work on boolean logic
-  decide +revert -- But decide will do the job
-
--- Use `omega` for linear int/nat arithmetic
-example (a b : Nat) (h : a ≤ b) : a + 3 ≤ b + 3 := by
-  try decide -- decide won't deal with linear arithmetic
-  omega -- but use omega for that
-
--- Use `ring` for polynomial/ring equalities
-example (x y : Int) : (x + y)^2 = x^2 + 2*x*y + y^2 := by
-  try omega
-  ring
-
-end toto
-
-/-- Output of the 1-bit full adder: sum bit `res_o` and carry-out `c_o`. -/
-structure FA.Out where
-  res_o : Bool
-  c_o   : Bool
-  deriving Repr, DecidableEq
-
-def fa (a b c : Bool) : FA.Out :=
-  let r := a ^^ b  ^^ c
-  let c' := a && b  || a && c || b && c
-  ⟨r, c'⟩
-
-/-- The 1-bit adder really computes `a + b + c`. -/
-theorem fa_correct (a b c : Bool) :
-    a.toNat + b.toNat + c.toNat
-      = (fa a b c).res_o.toNat + 2 * (fa a b c).c_o.toNat := by
-  decide +revert -- THis passes !! What's wrong with the first one ?
+end Adder_1bit
 
 /- -------------------------------------------------------------------------------- -/
 /- -------------------------------------------------------------------------------- -/
 /- -------------------------------------------------------------------------------- -/
 
-/-! ## N-bit ripple-carry adder -/
+/-! ## 4-bit ripple-carry adder
 
-structure FAN.Params where
+Before going to the N-bit adder, let's consider the particular instance N=4,
+to highlight how the 1-bit adders are chained.
+We won't introduce `N` as a parameter for now, we'll do that in next section.
+For now let's just have a small several-bits adder and prove it.
+
+In SystemVerilog, we'll could write the 4-bits adder as follows
+
+```
+module adder_4bit (
+  input  logic [3:0]  a_i;
+  input  logic [3:0]  b_i;
+  output logic [3:0]  r_o;
+  output logic        c_o;
+)
+
+  logic [4:0]  c;
+
+  assign ci[0] = 1'b0;
+
+  adder_1bit  u_add_b0 ( .c (c[0]) , .a (a_i[0]) , .b (b_i[0]) , .r (r_o[0]) , .c'(c[1]));
+  adder_1bit  u_add_b1 ( .c (c[1]) , .a (a_i[1]) , .b (b_i[1]) , .r (r_o[1]) , .c'(c[2]));
+  adder_2bit  u_add_b2 ( .c (c[2]) , .a (a_i[2]) , .b (b_i[2]) , .r (r_o[2]) , .c'(c[3]));
+  adder_3bit  u_add_b3 ( .c (c[3]) , .a (a_i[3]) , .b (b_i[3]) , .r (r_o[3]) , .c'(c[4]));
+
+  assign c_o = c[4];
+
+endmodule
+```
+-/
+
+namespace Adder_4bits
+
+/- Equivalent of a SystemVerilog parameter declaration -/
+structure Params where
   N : Nat
 
-structure FAN.In (p : FAN.Params) where
+/- And its value -/
+def params : Params where
+  N := 4
+
+/- Equivalent of a SystemVerilog module I/O declaration -/
+structure Inputs where
+  a : BitVec params.N
+  b : BitVec params.N
+deriving Repr, DecidableEq
+
+/- SV module output declaration -/
+structure Outputs where
+  r : BitVec params.N
+  c : Bool
+deriving Repr, DecidableEq
+
+def body (i : Inputs) : Outputs :=
+  -- Hardwiring first carry bit to 0
+  let c0 := 0
+  -- Instantiating the 4 1-bit adder modules and propagating the carry
+  let ⟨ r0 , c1 ⟩ := Adder_1bit.body ⟨ i.a.getLsbD 0, i.b.getLsbD 0, c0 ⟩
+  let ⟨ r1 , c2 ⟩ := Adder_1bit.body ⟨ i.a.getLsbD 1, i.b.getLsbD 1, c1 ⟩
+  let ⟨ r2 , c3 ⟩ := Adder_1bit.body ⟨ i.a.getLsbD 2, i.b.getLsbD 2, c2 ⟩
+  let ⟨ r3 , c4 ⟩ := Adder_1bit.body ⟨ i.a.getLsbD 3, i.b.getLsbD 3, c3 ⟩
+  -- Forge outputs
+  let r := BitVec.cons r3 (BitVec.cons r2 (BitVec.cons r1 (BitVec.cons r0 0#0)))
+  let c := c4
+  ⟨r, c⟩
+
+theorem v2.adder_correct (i : Inputs) :
+  let a := i.a.toNat
+  let b := i.b.toNat
+  let r := (body i).r.toNat
+  let c := (body i).c.toNat
+  a + b == r + (2 ^ params.N) * c := by
+  cases i with | mk a b =>
+  simp only [body, Adder_1bit.body, Adder_1bit.v1.body, params]
+  decide +revert
+
+theorem v2.adder_correct_alt (i : Inputs) :
+  BitVec.cons (body i).c (body i).r
+    =
+  (BitVec.zeroExtend (params.N + 1) i.a)
+    +
+  (BitVec.zeroExtend (params.N + 1) i.b) := by
+  cases i with | mk a b =>
+  simp only [body]
+  decide +revert
+
+end Adder_4bits
+
+/- -------------------------------------------------------------------------------- -/
+/- -------------------------------------------------------------------------------- -/
+/- -------------------------------------------------------------------------------- -/
+
+
+/-! ## N-bit ripple-carry adder
+
+Alright, we saw how 1-bit adders compose to form a several-bit adder.
+But we took 4 as a hardcoded value (there are 4 calls in above `body`)
+Of course we want to replace that with a more generic N-bit adder.
+
+First, here's what we'd like to map :
+
+```
+module adder_4bit (
+#( parameter int N )
+( input  logic [N-1:0]  a_i;
+  input  logic [N-1:0]  b_i;
+  output logic [N-1:0]  r_o;
+  output logic          c_o;
+)
+  logic [N:0]   c;
+
+  assign ci[0] = 1'b0;
+
+  generate
+    for k=0; k<N; k++ begin
+      adder_1bit u_add1
+      ( .c (c[k])
+      , .a (a[k])
+      , .b (b[k])
+      , .r (r[k])
+      , .c'(c[k+1])
+      );
+    endfor
+  endgenerate
+
+  assign c_o = c[N];
+endmodule
+```
+
+-/
+
+namespace Adder_Nbits
+
+/-
+
+### Handling SV module parameters
+The module I/O definition doesn't change much,
+the main addition is the parameter, which becomes an input
+to other constructs (`In`/`Out`/`body` etc.)
+-/
+structure Params where
+  N : Nat
+
+structure In (p : Params) where
   a : BitVec p.N
   b : BitVec p.N
   c : BitVec p.N
 
--- /-- Output of the N-bit adder. -/
--- structure FAN.Out (p : FAN.Params) where
---   r : BitVec p.size
---   c : Bool
+/-- Output of the N-bit adder. -/
+structure Out (p : Params) where
+  r : BitVec p.N
+  c : Bool
 
+/- Now for the body, the main question is,
+The `generate for` SV construct should map to which Lean construct ?
+
+First let's look at what we have inside the loop body :
+- SV module instantiation
+- SV assign
+
+More generally, what we want to map is :
+```
+generate
+  for (k = X, k < Y, k++)
+    assign some_sig[f(k)] = some_SV_expr(k)
+  end
+endgenerate
+```
+(The module instantiation is in essence equivalent to signal assignation.)
+
+
+### Handling SV generate-for loops
+
+Let's take a trivial use of `for` loops
+and see how it could systematically translate to Lean.
+
+```
+module toto
+#(parameter int N)
+( input logic [N-1:0] a_i
+, input logic [N-1:0] b_o
+);
+
+// Should be equivalent to 'assign b_o = a_i;'
+generate
+  for (k = 0, k < N, k++)
+    assign b_o[k] = a_i[k];
+  end
+endgenerate
+
+endmodule
+```
+-/
+
+namespace Toto
+
+structure Params where
+  N : Nat
+
+structure In (p : Params) where
+  a : BitVec p.N
+
+/-- Output of the N-bit adder. -/
+structure Out (p : Params) where
+  b : BitVec p.N
+
+-- `assign o = i;` maps to :
+def v1.body (p : Params) (i : In p) : Out p :=
+  let b := i.a
+  ⟨b⟩
+
+-- And the proof that output == input is really trivial
+theorem v1.out_eq_in (p : Params) (i : In p) :
+  let o := v1.body p i
+  o.b = i.a := by rfl
+
+-- Now for the `generate-for` could map to :
+def v2.body (p : Params) (i : In p) : Out p :=
+  -- The assignment of 'b' now depend on index 'k' so the trivial mapping is a function,
+  -- `b` is not just a variable but a function taking `k` as a parameter.
+  -- and the range of `k` is embedded in its type (0 to N)
+  -- First :
+  -- 1. generate the 'range', [0, 1, 2, 3, ..., N-1, N], it should be finite
+  -- 2. generate the b_rhs for a given element of the range
+  -- 3. fold the whole thing to finally assign b
+  let b_rhs := fun (k : Fin p.N) => i.a[k]
+  let b : BitVec p.N :=
+    -- Build your vector as a list of Bool
+    let l : List Bool := List.ofFn b_rhs
+    -- Concatenate them (there's the library built-in `ofBoolListLE`/`ofBoolListGE` for that)
+    let bv := BitVec.ofBoolListLE l
+    -- Justify BitVec l.length == BitVec p.N to the prover
+    BitVec.cast (by simp [l]) bv
+  ⟨b⟩
+
+theorem v2.out_eq_in (p : Params) (i : In p) :
+    (v2.body p i).b = i.a := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro i H_bound
+  -- NOTE : strangely, `simp [v2.body, H] doesn't work here
+  -- but `simp [v2.body] ; simp [H]` does
+  simp [v2.body]
+  simp [H_bound]
+
+
+/-
+```
+
+IGNORE BELOW
+
+From what we saw before, these two constructs lead to Lean definition and Lean function call.
+With the `for generate` loop, these constucts are now :
+- indexes by a parameter `k`, known at elaboration time
+- replicated for a range over `k` (from `0` to `N-1` here)
+
+
+
+-/
 
 /-
   Finding a way to mimick the below SV code but with a big Lean function definition.
   So that we can reason on it using rfl/bv_decide.
   However the handling of the carry is where we're stuck.
 
-  logic [N-1:0] ci;
-  logic [N:0]   co;
+module adder_4bit (
+#( parameter int N )
+( input  logic [N-1:0]  a_i;
+  input  logic [N-1:0]  b_i;
+  output logic [N-1:0]  r_o;
+  output logic          c_o;
+)
+  logic [N:0]   c;
 
   assign ci[0] = 1'b0;
 
   generate
     for k=0; k<N; k++ begin
-      fa u_fa ( .c (ci[k])
-              , .a (a[k])
-              , .b (b[k])
-              , .r (r[k])
-              , .c'(co[k])
+      adder_1bit u_add1
+      ( .c (c[k])
+      , .a (a[k])
+      , .b (b[k])
+      , .r (r[k])
+      , .c'(c[k+1])
       );
-    endfor
-
-    for k=0+1; k<N+1; k++ begin
-      assign ci[k] = co[k-1];
-    endfor
-  endgenerate
--/
-
-def FAN.co
-  (p : FAN.Params)
-  (i : FAN.In p)
-  (k : Nat)
-  (k_bound : 0 ≤ k ∧ k < p.N)
-  : Bool :=
-  fa (i.a.getLsbD k) (i.b.getLsbD k) (FAN.ci.getLsbD k)
-
-def FAN.ci (p : FAN.Params) (k : Nat)  : Bool :=
-  if _h0 : k = 0 then
-    false
-  else if _h1 : k < p.N then
-    FAN.co (k-1)
-  else
-    false
-
-
-
-
-/-- The N-bit ripple-carry adder, built by chaining 1-bit full adders.
-    The head bit is the LSB and is processed first; its carry-out is
-    fed into the recursive call on the tail. -/
-def fan : (n : Nat) → BitVec n → BitVec n → Bool → FAN.Out n :=
-/-
-  logic [N-1:0] ci;
-  logic [N:0]   co;
-
-  assign ci[0] = 1'b0;
-
-  generate
-    for k=0; k<N; k++ begin
-      fa u_fa ( .c (ci[k])
-              , .a (a[k])
-              , .b (b[k])
-              , .r (r[k])
-              , .c'(co[k])
-      );
-    endfor
-
-    for k=0+1; k<N+1; k++ begin
-      assign ci[k] = co[k-1];
     endfor
   endgenerate
 
+  assign c_o = c[N];
+endmodule
+
 -/
-  let out : BitVec n := 0x0
-  let carry : BitVec (n+1) := 0x0
-  -- What would the for generate module instantiation look like ?
-  -- I guess for generate loop translate into 'map' in Lean i guess ?
-  -- What about module instantiation ? function call ?
-  sorry
-
-
-/-
-SV        |   Lean
-& | ~     |   &&& ||| ~~~
-struct    |   structure
-enum      |   inductive
-assign    |   def
-module    |   namespaces and structures for signature ?
-module instantiation | function evaluation
-generate  |   k-indexing of inner assign
--/
-
-def FAN.
-
-def FAN.r (k : Nat) := fa FAN.
-
-
-
-
-
-
-
-/-! ## Decomposition lemma
-
-    The N-bit adder = (N-1)-bit adder feeding a 1-bit adder.
-
-    The most useful form is usually a rewrite that exposes one call to
-    `fa` (on the head bits) and one recursive call to `fan` (on the
-    tails). Replace `True` below with whatever statement makes
-    `fan_correct` go through cleanly. -/
-theorem fan_split (n : Nat) (a b : BV (n+1)) (cin : Bool) :
-    True := by   -- TODO: replace `True` with the real statement
-  sorry
-
-
-/-! ## Correctness of the N-bit adder
-
-    Proof by induction on `n`, using `fa_correct` and `fan_split`. -/
-theorem fan_correct (n : Nat) (a b : BV n) (cin : Bool) :
-    a.toNat + b.toNat + cin.toNat
-      = (fan n a b cin).res_o.toNat + 2^n * (fan n a b cin).c_o.toNat := by
-  sorry
-
-end Adder
