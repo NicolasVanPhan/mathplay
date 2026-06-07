@@ -306,6 +306,223 @@ end Adder_4bits
 /- -------------------------------------------------------------------------------- -/
 
 
+/-! ## Interlude : Range assignment
+Before we can jump to the N-bit adder, we'll need to see how to map indexed signals.
+
+The idea is :
+If a SV signal maps to a Lean definition
+An indexed signal maps to an indexed Lean definition.
+`logic [N-1:0] c = ...;` ↔ `def c (k : Fin N) := ...`
+
+The SV range selection simply maps to `c` function call :
+`assign toto = c[42];` ↔ `def toto := c 42`
+
+Problem 1 :
+The main problem will be, how to generate `def c` ?
+In general, assignment of `c` will be scattered across the code.
+While Lean needs a single grouped definition for `c`.
+The compiler will need to gather the spread assignments
+
+```
+assign c[0] = 1'b0; // assignment of some range
+/* some code... then later on :*/
+assign c[N-1:1] = 0xdeadbeef; // assignment of another range
+```
+
+Problem 2 :
+2.1. Assigned ranges need to form a partition of the whole range.
+```
+assign c[2:0] = ...;
+assign c[4:1] = ...;
+```
+Is incorrect as it concurrently drives `c[2:1]` twice.
+
+2.2. Also we want to be sure all bits are assigned.
+```
+assign c[N-1:1] = 0xdeadbeef;
+```
+There is no driver for `c[0]`.
+
+We could imagine the compiler to gather range assignment,
+generate a description of all ranges `k_range1`, `k_range2` etc.
+Also generate the range of the whole signal `k_range_whole` as ⟦0:N-1⟧.
+
+Then generate a proof that :
+- union of the ranges form the whole range (solves 2.2)
+- intersection of any two ranges is empty (solves 2.1)
+As we're staying in linear algebra here, such proofs
+should easily be automated with `omega`.
+
+Now the definition for `c` should look ideally like below :
+
+```lean
+def c (k : Fin N) :=
+  match k with
+  | /* range 1 */ => c_rhs1 k
+  | /* range 2 */ => c_rhs2 k
+  | /* ... */
+  | /* range n */ => c_rhs2 n
+```
+
+Below is an attempt at reproducing this,
+while we couldn't reach this exact form,
+the result is pretty much similar.
+
+We'll work on a dummy example, multiplying a value by 2,
+which is trivally done by right-shifting the bit vector.
+
+-/
+
+namespace Mult2
+
+/- Equivalent of a SystemVerilog parameter declaration -/
+structure Params where
+  N : Nat
+
+/- And its value -/
+def params : Params where
+  N := 4
+
+/- Equivalent of a SystemVerilog module I/O declaration -/
+structure Inputs where
+  n : BitVec params.N
+deriving Repr, DecidableEq
+
+/- SV module output declaration -/
+structure Outputs where
+  n : BitVec (params.N + 1)
+deriving Repr, DecidableEq
+
+/-
+module Mult2 (
+input  logic [N-1:0] n_i
+output logic [N:0]   n_o
+)
+  logic [N:0] n;
+  assign n[0]   = 1'b0;
+  assign n[N:1] = n_i[N-1:0];
+  assign n_o    = n;
+endmodule
+
+The internal signal `n` is an SV indexed signal, driven by *two* separate
+`assign` statements on disjoint sub-ranges :
+  - n[0]   = 0
+  - n[N:1] = n_i[N-1:0]
+
+Following the principle :
+    SV indexed signal = Lean indexed function
+the wire `n` becomes a Lean function
+    `n : Inputs → Fin (N+1) → Bool`
+
+When several `assign` statements drive disjoint sub-ranges of the same signal,
+we map each `assign` to its own rhs function defined on the relevant sub-range
+(modeled as a subtype of the whole index range), then combine all the per-range
+rhs into the single indexed function.
+
+For the construct to make sense, the sub-ranges must form a *partition* of the
+whole range — we prove that explicitly below.
+-/
+
+/- ------------------------------------------------------------------ -/
+/- 1. Whole range and per-`assign` sub-range predicates                -/
+/- ------------------------------------------------------------------ -/
+
+/- The whole index range of `n` (SV `logic [N:0] n;` → N+1 indices) -/
+abbrev k_whole : Type := Fin (params.N + 1)
+
+/- One predicate per SV `assign` describing the sub-range it covers.
+   These predicates are the *single source of truth* for the ranges :
+   every subtype, theorem and dispatch below derives from them. -/
+abbrev range1 (k : k_whole) : Prop := 0 ≤ k.val ∧ k.val ≤ 0        -- SV `[0:0]`
+abbrev range2 (k : k_whole) : Prop := 1 ≤ k.val ∧ k.val ≤ params.N -- SV `[N:1]`
+
+/- Sub-range types - derived from the predicates -/
+abbrev k_range1 : Type := { k : k_whole // range1 k }
+abbrev k_range2 : Type := { k : k_whole // range2 k }
+
+/- ------------------------------------------------------------------ -/
+/- 2. Partition proofs - referencing only the predicates above         -/
+/- ------------------------------------------------------------------ -/
+
+/- 1. The ranges cover the whole index space -/
+theorem k_range_cover (k : k_whole) : range1 k ∨ range2 k := by omega
+/- 2. The ranges are pairwise disjoint -/
+theorem k_range_disjoint (k : k_whole) : ¬ (range1 k ∧ range2 k) := by omega
+
+/- ------------------------------------------------------------------ -/
+/- 3. Per-`assign` rhs functions - one Lean def per SV `assign`        -/
+/- ------------------------------------------------------------------ -/
+
+/- RHS for `assign n[0] = 1'b0;` -/
+def n_rhs1 (_k : k_range1) : Bool := false
+
+/- RHS for `assign n[k] = n_i[k-1];` (for k in [1, N]) -/
+def n_rhs2 (i : Inputs) (k : k_range2) : Bool :=
+  i.n.getLsbD (k.val.val - 1)
+
+/- ------------------------------------------------------------------ -/
+/- 4. Dispatch & assembly into the indexed signal                      -/
+/- ------------------------------------------------------------------ -/
+
+/-
+The grail for the assembly would be a syntax like :
+    match k with
+    | k in range1 => n_rhs1 k
+    | k in range2 => n_rhs2 i k
+Lean doesn't have that directly, but we can recover it cleanly by tagging
+every `k` with evidence of *which* range it falls into, then matching on
+the tag. The pattern scales to any number of ranges of any shape :
+  - add one predicate `range_i` to (1)
+  - extend the partition proofs in (2)
+  - add one rhs `n_rhs_i` to (3)
+  - add one constructor / arm to `RangeMatch` / `range_of` / `n` below.
+-/
+
+/- Tagged disjoint union of all sub-range subtypes - one constructor per range -/
+inductive RangeMatch : Type
+  | r1 : k_range1 → RangeMatch
+  | r2 : k_range2 → RangeMatch
+
+/- Dispatch : determines which range each `k` belongs to.
+   Mechanical : one dependent-if per range, with the trailing `else` discharged
+   by `k_range_cover` (the partition guarantees the chain is exhaustive). -/
+def range_of (k : k_whole) : RangeMatch :=
+  if h : range1 k
+    then .r1 ⟨k, h⟩
+    else .r2 ⟨k, (k_range_cover k).resolve_left h⟩
+
+/- The indexed signal - one rhs call per range arm.
+   Reads exactly like the "match k in range_i => rhs_i" form we wanted. -/
+def n (i : Inputs) (k : k_whole) : Bool :=
+  match range_of k with
+  | .r1 k => n_rhs1 k
+  | .r2 k => n_rhs2 i k
+
+/- The module body : `assign n_o = n;` — drive the output bit-by-bit from `n`.
+   `BitVec.ofFnLE` (from Batteries) is the generic indexed-function-to-BitVec
+   converter : `(f : Fin n → Bool) → BitVec n`, little-endian (so `f 0` is LSB),
+   which is exactly the convention `n` follows. -/
+def body (i : Inputs) : Outputs :=
+  ⟨BitVec.ofFnLE (n i)⟩
+
+/- Behavioural correctness : the module doubles its input. -/
+theorem out_is_2x_in (i : Inputs) :
+    (body i).n.toNat = 2 * i.n.toNat := by
+  cases i with | mk n_in =>
+  decide +revert
+
+end Mult2
+
+
+
+
+/- -------------------------------------------------------------------------------- -/
+/- -------------------------------------------------------------------------------- -/
+/- -------------------------------------------------------------------------------- -/
+
+
+
+
 /-! ## N-bit ripple-carry adder
 
 Alright, we saw how 1-bit adders compose to form a several-bit adder.
@@ -367,7 +584,7 @@ structure Out (p : Params) where
   c : Bool
 
 /- Now for the body, the main question is,
-The `generate for` SV construct should map to which Lean construct ?
+Which Lean construct should the `generate for` SV construct should map to ?
 
 First let's look at what we have inside the loop body :
 - SV module instantiation
@@ -381,7 +598,11 @@ generate
   end
 endgenerate
 ```
-(The module instantiation is in essence equivalent to signal assignation.)
+The module instantiation is in essence equivalent to signal assignation.
+You feed a bunch of signals with the module's output.
+And you feed the module's input with another bunch of signals.
+
+assign outputs = f_module inputs
 
 
 ### Handling SV generate-for loops
@@ -434,20 +655,35 @@ def v2.body (p : Params) (i : In p) : Out p :=
   -- The assignment of 'b' now depend on index 'k' so the trivial mapping is a function,
   -- `b` is not just a variable but a function taking `k` as a parameter.
   -- and the range of `k` is embedded in its type (0 to N)
-  -- First :
-  -- 1. generate the 'range', [0, 1, 2, 3, ..., N-1, N], it should be finite
-  -- 2. generate the b_rhs for a given element of the range
-  -- 3. fold the whole thing to finally assign b
-  let b_rhs := fun (k : Fin p.N) => i.a[k]
+  --
+  -- We could introduce a `k` parameter of type ℕ but there are two problems with that :
+  -- 1. We lose the notion of bounds (we must ask for a proof of `k ≤ N`)
+  -- 2. The `decide` works better with finite types
+  -- So instead, we'll use the `Fin` type family)
+  -- `Fin 42` represents the set of naturals between `0` and `41`,
+  -- it embeds the bounds in the type and is `decide`-friendly.
+  -- It works in 3 steps :
+  --
+  -- 1. declare the 'range', [0, 1, 2, 3, ..., N-1, N].
+  let b_range := Fin p.N
+  -- 2. declare `b_rhs` - the expression to assign to `b`, function of `k`.
+  let b_rhs := fun (k : b_range) => i.a[k]
+  -- 3. Drive `b` - fold `b_rhs` over `Fin N` to assign all bits of `b`.
   let b : BitVec p.N :=
-    -- Build your vector as a list of Bool
+    -- List.ofFn evaluates the `b_rhs` function
+    -- with each element of `b_range`
+    -- and yields all the results in a `List`.
+    -- e.g. `List.ofFn (fun (k : Fin 3) => f k)`
+    -- produces `[f 3, f 2, f 1, f 0]`
     let l : List Bool := List.ofFn b_rhs
-    -- Concatenate them (there's the library built-in `ofBoolListLE`/`ofBoolListGE` for that)
-    let bv := BitVec.ofBoolListLE l
-    -- Justify BitVec l.length == BitVec p.N to the prover
+    -- Concatenate them
+    let bv : BitVec l.length := BitVec.ofBoolListLE l
+    -- This boilerplate cast is needed
+    -- to justify `BitVec l.length == BitVec p.N` to the prover
     BitVec.cast (by simp [l]) bv
   ⟨b⟩
 
+-- And the proof that the second module behaves as the first
 theorem v2.out_eq_in (p : Params) (i : In p) :
     (v2.body p i).b = i.a := by
   apply BitVec.eq_of_getLsbD_eq
@@ -457,26 +693,149 @@ theorem v2.out_eq_in (p : Params) (i : In p) :
   simp [v2.body]
   simp [H_bound]
 
+end Toto
+
 
 /-
-```
 
-IGNORE BELOW
+TODO : Graph with adder 1-bit modules showing the need for recursion.
+TODO : What about mutually recursive modules ??
+       Can we avoid mutually recursive functions ?
 
-From what we saw before, these two constructs lead to Lean definition and Lean function call.
-With the `for generate` loop, these constucts are now :
-- indexes by a parameter `k`, known at elaboration time
-- replicated for a range over `k` (from `0` to `N-1` here)
+In principle, there are no combinational loops, so no infinite recursive calls.
+However we'd need to justify that to the prover.
 
 
+         +--------+
+   a0--->|a      r|---->  r0
+   b0--->|b       |
+   c0--->|ci    co|---+>
+         +--------+   |
+                      |
+ +--------------------+
+ |       +--------+
+ | a1--->|a      r|---->  r1
+ | b1--->|b       |
+ +-c1--->|ci    co|---+>
+         +--------+   |
+                      |
+ +--------------------+
+ |       +--------+
+ | a2--->|a      r|---->  r2
+ | b2--->|b       |
+ +-c2--->|ci    co|---->
+         +--------+
+
+Here, we see that (add_1bit 2) calls (add_1bit 1), which itself calls (add_1bit 0).
+So we cannot get our way with a `map` only.
+
+The module instances `k` needs the input carry `k`,
+and the input carry `k` needs the module instance `k-1`,
+there's a mutual recursive pattern here so we'll map it to mutually recursive `def`s.
+
+-/
+mutual
+
+-- module instantiation : performs `r[k] := u_add1.r` and `c[k+1] := u_add1.c`
+def v1.u_add1 (p : Params) (i : In p) (k : Fin p.N) : Adder_1bit.Outputs :=
+  Adder_1bit.body ⟨i.a[k], i.b[k], v1.ci p i k.castSucc⟩
+
+-- carry signal : combines `assign c[0] := 1'b0` and `c[k+1] := u_add1[k].c`.
+-- Indexed by `Fin (p.N + 1)` because `c` has `N+1` bits (0 to N).
+def v1.ci (p : Params) (i : In p) (k : Fin (p.N + 1)) : Bool :=
+  match k with
+  | ⟨0, _⟩ => false
+  | ⟨n+1, h⟩ => (v1.u_add1 p i ⟨n, by omega⟩).c
+
+end
+
+def v1.body (p : Params) (i : In p) : Out p :=
+  -- generate-for: for k in [0, N), assign `r[k] := u_add1[k].r`
+  let r : BitVec p.N :=
+    let r_rhs := fun (k : Fin p.N) => (v1.u_add1 p i k).r
+    let l : List Bool := List.ofFn r_rhs
+    let bv : BitVec l.length := BitVec.ofBoolListLE l
+    BitVec.cast (by simp [l]) bv
+  -- assign c_o := c[N]
+  let c : Bool := v1.ci p i (Fin.last p.N)
+  ⟨r, c⟩
+
+
+/-
+Fundamentally :
+It's the `c` assignment that is a `scan`
+c 0 = 0
+c k = f_add(a k-1, b k-1, c k-1).c
+Then the `r` assignment is just a classic function call, a call to the recursive `c` function
+r k = f_add(a k, b k, c k).r
 
 -/
 
-/-
-  Finding a way to mimick the below SV code but with a big Lean function definition.
-  So that we can reason on it using rfl/bv_decide.
-  However the handling of the carry is where we're stuck.
+-- carry signal : combines `assign c[0] := 1'b0` and `c[k+1] := u_add1[k].c`.
+-- Indexed by `Fin (p.N + 1)` because `c` has `N+1` bits (0 to N).
+def v1.c (p : Params) (i : In p) (k : Fin (p.N + 1)) : Bool :=
+  match k with
+  | ⟨0, _⟩  /- ⟨range 0:0, H_proof_it_is_in_0:0 -/ => false
+  | ⟨k, H⟩  /- ⟨range 1:p.N, H_proof_it_is_in_1:p.N -/ =>
+    let u_add1 (p : Params) (i : In p) (k : Fin p.N) : Adder_1bit.Outputs :=
+      Adder_1bit.body ⟨i.a[k], i.b[k], v1.ci p i k.castSucc⟩
+    (v1.u_add1 p i ⟨k, by omega⟩).c
 
+
+
+
+
+/-
+
+This style works but there's a some logic that is not
+mechanically generatable for a transpiler :
+- the `k.castSucc`
+- the `match k with 0, n+1..`
+- the `Fin.last` too
+
+The problem is that Lean fundamentally needs to know about
+cross-instances calls (for a termination guarantee)
+while SV doesn't provide that at all.
+So we can't bring more information during transpilation.
+
+The other solution is to ask the use for that information upfront :
+- for independent loops : a DSL `map` will lead to a Lean `map`
+- for cascaded loops (like here ): a DSL `scan` will lead to a Lean `scan/fold`
+  The `scan` will be like a `map` but with memory, where instance `k`
+  can access information from previous instances (`0..k-1`)
+- for arbitrary dependent loops : Can't guarantee there's no combinatory loops, forbid.
+
+The adder DSL code would look like :
+
+```
+scan k in 0..N
+  state c : Bool init false
+  output r[k] : Bool
+  step:
+    let fa = add_1bit(a[k], b[k], c)
+    r[k] := fa.r
+    c    := fa.c
+return r, c
+```
+
+
+One thing is, if we want the freedom to assign c[0] and c[k] (1<k<N) separately,
+- we need either partial functions (but not proof friendly at all so it's a no go)
+- or we need the transpiler to gather the various assigned ranges
+  into a single function assigning `c`, not transpiler friendly.
+- or we constrain the user to define the whole range in a single block, not user friendly.
+
+
+```
+Fundamentally :
+It's the `c` assignment that is a `scan`
+c 0 = 0
+c k = f_add(a k-1, b k-1, c k-1).c
+Then the `r` assignment is just a classic function call, a call to the recursive `c` function
+r k = f_add(a k, b k, c k).r
+```
+
+```
 module adder_4bit (
 #( parameter int N )
 ( input  logic [N-1:0]  a_i;
@@ -486,21 +845,73 @@ module adder_4bit (
 )
   logic [N:0]   c;
 
-  assign ci[0] = 1'b0;
-
   generate
+    // mechanical module instantiation
+    // it's the assignment of all o_xxx signals
     for k=0; k<N; k++ begin
+      i_c[k] = c[k];
+      i_a[k] = a[k];
+      i_b[k] = b[k];
       adder_1bit u_add1
-      ( .c (c[k])
-      , .a (a[k])
-      , .b (b[k])
-      , .r (r[k])
-      , .c'(c[k+1])
+      ( .c (i_c[k])
+      , .a (i_a[k])
+      , .b (i_b[k])
+      , .r (o_r[k])
+      , .c'(o_c[k])
       );
     endfor
+
+    // driving of c
+    assign ci[0] = 1'b0;
+    for k=1; k<N+1; k++ begin
+      assign ci[k] = o_c[k-1];
+    enfor
+
+    // driving of r output
+    for k=0; k<N; k++ begin
+      r[k] = o_r[k];
+    endfor
+
+    // driving of c output
+    assign c_o = c[N];
+
   endgenerate
 
-  assign c_o = c[N];
 endmodule
+```
+
+It seems to me the main difficulty here is information gain/loss.
+I want my DSL to be as close as possible to SV, while being able to transpile to proof-friendly Lean code.
+
+But in terms of information expressed in the code, SV has less than proof-friendly Lean.
+1. SV description just loops and plug wires together
+2. Lean description explicits inter-instance dependencies and the recursion scheme at play (map, scan, arbitrary)
+
+Going from 2. to 1. involves a loss of information, no problem at all, we just map all the recursion schemes to a generate-for
+Going from 1. to 2. is the problem. We need to get the information somewhere :
+- either upfront (asking the user for an explicit scheme)
+- midway, inferring it in the transpiler (which is not trivial at all)
+- downstream, getting a raw Lean description and manually proving it equivalent to an abstract scan/fold etc.
+
+I think I've hit a key problem for this kind of projects.
+Here I mention retrieving the 'map/scan/fold' structure but the problem applies much more broadly,
+we need to reconstruct the proof-relevant abstraction boundary to get a proof-friendly Lean code.
+
+The real problem is not transpilation, but abstraction recovery.
+SV and Lean are not just two different syntaxes for the same object, they encourage two different notions for what the object is.
+SV is used to elaborate HW, it just wants to know the netlist connections.
+Lean is used for proofs (at least that's the goal), it needs extra information on the design's symmetries (here, the recursion scheme at play) to enable smooth proof automation.
+
+The SV->Lean transpilation is a decompilation problem, it requires to recover a high-level explanation from a low level structural description.
+
+This is the central danger for this DSL project.
+If it is too close to SV, it may be comfortable for hardware designers but impoverished for proofs.
+If it is too close to Lean, it may be elegant for theorem proving but alien to hardware designers.
+The project lives exactly in that tension.
+
+Transpiling isn't the right word, it makes it look like a syntax-only problem.
+The real deal is recovering *structure* absent from SV and needed for proofs.
+
+
 
 -/
